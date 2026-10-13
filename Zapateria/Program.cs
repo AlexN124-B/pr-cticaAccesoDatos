@@ -7,6 +7,13 @@ namespace Zapateria
     internal class Program
     {
         const string Servidor = "62.171.180.115";
+        public record ProductosPorMarca(string Marca, long Total);
+        public record ProductoSinStock(string Codigo, string Nombre);
+        public record ImportePorMes(string Mes, decimal Importe);
+        public record ProductoVendido(string Codigo, string Nombre, string Marca, long Unidades);
+        public record FacturacionCategoriaPago(string Categoria, string FormaPago, decimal Importe);
+        public record ClienteTop(string Codigo, string Nombre, long Tickets, decimal Importe);
+        public record DiferenciaPrecio(long Lineas, decimal Diferencia);
 
         static string? _usuario;
         static string? _clave;
@@ -220,7 +227,7 @@ namespace Zapateria
                 string? nombreOriginal = producto?["marca"]?["nombre"]?.GetValue<string>();
                 string? paisOriginal = producto?["marca"]?["pais"]?.GetValue<string>();
 
-                string? nombre = nombreOriginal?.Trim();
+                string? nombre = string.IsNullOrWhiteSpace(nombreOriginal) ? null : System.Globalization.CultureInfo.InvariantCulture.TextInfo.ToTitleCase(nombreOriginal.Trim().ToLowerInvariant());
                 string? pais = paisOriginal?.Trim();
 
                 if (nombre != nombreOriginal || pais != paisOriginal)
@@ -390,7 +397,7 @@ namespace Zapateria
             }
 
             // 1. Mapa nombre de marca -> id_marca, leído de la base de datos
-            var idMarcas = new Dictionary<string, int>();
+            var idMarcas = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             const string sqlMarcas = "SELECT id_marca, nombre FROM marcas";
             using (var comandoMarcas = new MySqlCommand(sqlMarcas, conexion))
             using (var lector = comandoMarcas.ExecuteReader())
@@ -1138,23 +1145,236 @@ namespace Zapateria
             ImportarLineasTicket(conexion, raiz);
         }
 
+        public static List<ProductosPorMarca> ConsultarProductosPorMarca(MySqlConnection conexion)
+        {
+            var resultado = new List<ProductosPorMarca>();
+
+            const string sql = @"SELECT m.nombre, COUNT(p.codigo) AS total
+                         FROM marcas m
+                         LEFT JOIN productos p ON p.id_marca = m.id_marca
+                         GROUP BY m.id_marca, m.nombre
+                         ORDER BY total DESC, m.nombre";
+
+            using var comando = new MySqlCommand(sql, conexion);
+            using var lector = comando.ExecuteReader();
+
+            while (lector.Read())
+            {
+                resultado.Add(new ProductosPorMarca(lector.GetString("nombre"), lector.GetInt64("total")));
+            }
+
+            return resultado;
+        }
+        public static List<ProductoSinStock> ConsultarProductosSinStock(MySqlConnection conexion)
+        {
+            var resultado = new List<ProductoSinStock>();
+
+            const string sql = @"SELECT p.codigo, p.nombre
+                         FROM productos p
+                         WHERE NOT EXISTS (
+                             SELECT 1
+                             FROM producto_talla pt
+                             WHERE pt.codigo = p.codigo AND pt.stock > 0
+                         )
+                         ORDER BY p.codigo";
+
+            using var comando = new MySqlCommand(sql, conexion);
+            using var lector = comando.ExecuteReader();
+
+            while (lector.Read())
+            {
+                resultado.Add(new ProductoSinStock(lector.GetString("codigo"), lector.GetString("nombre")));
+            }
+
+            return resultado;
+        }
+        public static List<ImportePorMes> ConsultarImportePorMes(MySqlConnection conexion)
+        {
+            var resultado = new List<ImportePorMes>();
+
+            const string sql = @"SELECT DATE_FORMAT(t.fecha, '%Y-%m') AS mes,
+                                ROUND(SUM(l.unidades * l.precio_unitario * (1 - COALESCE(l.descuento_pct, 0) / 100)), 2) AS importe
+                         FROM lineas_ticket l
+                         JOIN tickets t ON t.id_ticket = l.id_ticket
+                         GROUP BY mes
+                         ORDER BY mes";
+
+            using var comando = new MySqlCommand(sql, conexion);
+            using var lector = comando.ExecuteReader();
+
+            while (lector.Read())
+            {
+                resultado.Add(new ImportePorMes(lector.GetString("mes"), lector.GetDecimal("importe")));
+            }
+
+            return resultado;
+        }
+
+        public static List<ProductoVendido> ConsultarTopProductosVendidos(MySqlConnection conexion)
+        {
+            var resultado = new List<ProductoVendido>();
+
+            const string sql = @"SELECT p.codigo, p.nombre, m.nombre AS marca,
+                                CAST(SUM(l.unidades) AS SIGNED) AS unidades
+                         FROM lineas_ticket l
+                         JOIN productos p ON p.codigo = l.codigo
+                         JOIN marcas m ON m.id_marca = p.id_marca
+                         GROUP BY p.codigo, p.nombre, m.nombre
+                         ORDER BY unidades DESC, p.codigo
+                         LIMIT 5";
+
+            using var comando = new MySqlCommand(sql, conexion);
+            using var lector = comando.ExecuteReader();
+
+            while (lector.Read())
+            {
+                resultado.Add(new ProductoVendido(
+                    lector.GetString("codigo"),
+                    lector.GetString("nombre"),
+                    lector.GetString("marca"),
+                    lector.GetInt64("unidades")));
+            }
+
+            return resultado;
+        }
+        public static List<FacturacionCategoriaPago> ConsultarFacturacionCategoriaPago(MySqlConnection conexion)
+        {
+            var resultado = new List<FacturacionCategoriaPago>();
+
+            const string sql = @"SELECT COALESCE(p.categoria, 'Sin catálogo') AS categoria,
+                                t.forma_pago,
+                                ROUND(SUM(l.unidades * l.precio_unitario * (1 - COALESCE(l.descuento_pct, 0) / 100)), 2) AS importe
+                         FROM lineas_ticket l
+                         JOIN tickets t ON t.id_ticket = l.id_ticket
+                         LEFT JOIN productos p ON p.codigo = l.codigo
+                         GROUP BY categoria, t.forma_pago
+                         ORDER BY categoria, t.forma_pago";
+
+            using var comando = new MySqlCommand(sql, conexion);
+            using var lector = comando.ExecuteReader();
+
+            while (lector.Read())
+            {
+                resultado.Add(new FacturacionCategoriaPago(
+                    lector.GetString("categoria"),
+                    lector.GetString("forma_pago"),
+                    lector.GetDecimal("importe")));
+            }
+
+            return resultado;
+        }
+
+        public static List<ClienteTop> ConsultarTopClientes(MySqlConnection conexion)
+        {
+            var resultado = new List<ClienteTop>();
+
+            const string sql = @"SELECT c.id, c.nombre,
+                                COUNT(DISTINCT t.id_ticket) AS tickets,
+                                ROUND(SUM(l.unidades * l.precio_unitario * (1 - COALESCE(l.descuento_pct, 0) / 100)), 2) AS importe
+                         FROM clientes c
+                         JOIN tickets t ON t.id_cliente = c.id
+                         JOIN lineas_ticket l ON l.id_ticket = t.id_ticket
+                         GROUP BY c.id, c.nombre
+                         ORDER BY importe DESC, c.id
+                         LIMIT 10";
+
+            using var comando = new MySqlCommand(sql, conexion);
+            using var lector = comando.ExecuteReader();
+
+            while (lector.Read())
+            {
+                resultado.Add(new ClienteTop(
+                    lector.GetString("id"),
+                    lector.GetString("nombre"),
+                    lector.GetInt64("tickets"),
+                    lector.GetDecimal("importe")));
+            }
+
+            return resultado;
+        }
+
+        public static DiferenciaPrecio ConsultarDiferenciaPrecio(MySqlConnection conexion)
+        {
+            const string sql = @"SELECT COUNT(*) AS lineas,
+                                COALESCE(ROUND(SUM(l.unidades * (p.precio - l.precio_unitario)), 2), 0) AS diferencia
+                         FROM lineas_ticket l
+                         JOIN productos p ON p.codigo = l.codigo
+                         WHERE l.precio_unitario <> p.precio";
+
+            using var comando = new MySqlCommand(sql, conexion);
+            using var lector = comando.ExecuteReader();
+
+            lector.Read();
+            return new DiferenciaPrecio(lector.GetInt64("lineas"), lector.GetDecimal("diferencia"));
+        }
+
         public static void Main()
         {
             try
             {
-                MySqlConnection ConexionBBDD = EstablacerConexion();
                 JsonNode? raiz = LeerJsonZapateria();
-                Reiniciar(ConexionBBDD);
+                if (raiz is null)
+                {
+                    Console.WriteLine("No se pudo cargar el JSON. Se cancela el programa.");
+                    return;
+                }
+
+                using MySqlConnection ConexionBBDD = EstablacerConexion();
+
                 CrearTablas(ConexionBBDD);
                 ImportarTablas(ConexionBBDD, raiz);
+
+                Console.WriteLine();
+                Console.WriteLine("P01 - Productos por marca:");
+                foreach (ProductosPorMarca fila in ConsultarProductosPorMarca(ConexionBBDD))
+                {
+                    Console.WriteLine($"{fila.Marca}: {fila.Total} productos");
+                }
+                Console.WriteLine();
+                Console.WriteLine("P02 - Productos sin stock en ninguna talla:");
+                foreach (ProductoSinStock fila in ConsultarProductosSinStock(ConexionBBDD))
+                {
+                    Console.WriteLine($"{fila.Codigo} - {fila.Nombre}");
+                }
+                Console.WriteLine();
+                Console.WriteLine("P03 - Importe facturado por mes:");
+                foreach (ImportePorMes fila in ConsultarImportePorMes(ConexionBBDD))
+                {
+                    Console.WriteLine($"{fila.Mes}: {fila.Importe:N2} €");
+                }
+
+                Console.WriteLine();
+                Console.WriteLine("P04 - Los 5 productos más vendidos en unidades:");
+                foreach (ProductoVendido fila in ConsultarTopProductosVendidos(ConexionBBDD))
+                {
+                    Console.WriteLine($"{fila.Codigo} - {fila.Nombre} ({fila.Marca}): {fila.Unidades} unidades");
+                }
+                Console.WriteLine();
+                Console.WriteLine("P05 - Facturación por categoría y forma de pago:");
+                foreach (FacturacionCategoriaPago fila in ConsultarFacturacionCategoriaPago(ConexionBBDD))
+                {
+                    Console.WriteLine($"{fila.Categoria} / {fila.FormaPago}: {fila.Importe:N2} €");
+                }
+
+                Console.WriteLine();
+                Console.WriteLine("P06 - Los 10 clientes que más han gastado:");
+                foreach (ClienteTop fila in ConsultarTopClientes(ConexionBBDD))
+                {
+                    Console.WriteLine($"{fila.Codigo} - {fila.Nombre}: {fila.Tickets} tickets, {fila.Importe:N2} €");
+                }
+
+                Console.WriteLine();
+                Console.WriteLine("P07 - Líneas vendidas a precio distinto del de catálogo:");
+                DiferenciaPrecio diferencia = ConsultarDiferenciaPrecio(ConexionBBDD);
+                Console.WriteLine($"{diferencia.Lineas} líneas, diferencia total: {diferencia.Diferencia:N2} €");
             }
             catch (MySqlException ex)
             {
-                Console.WriteLine($"Algo ha salido mal con la conexion Error: {ex.Message}");
+                Console.WriteLine($"Error de MySQL ({ex.ErrorCode}): {ex.Message}");
             }
-            catch (ArgumentException)
+            catch (ArgumentException ex)
             {
-                Console.WriteLine($"Algo ha salido mal en los argumentos de la conexion.a");
+                Console.WriteLine($"Configuración de conexión no válida: {ex.Message}");
             }
         }
     }
