@@ -1147,9 +1147,6 @@ namespace Zapateria
                 Reiniciar(ConexionBBDD);
                 CrearTablas(ConexionBBDD);
                 ImportarTablas(ConexionBBDD, raiz);
-
-
-
             }
             catch (MySqlException ex)
             {
