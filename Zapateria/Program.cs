@@ -611,6 +611,533 @@ namespace Zapateria
             }
         }
 
+        public static void ImportarProductoTalla(MySqlConnection conexion, JsonNode? raiz)
+        {
+            if (raiz is null)
+            {
+                Console.WriteLine("No hay datos del JSON para importar.");
+                return;
+            }
+
+            // 1. Códigos de producto que existen en la base
+            var codigosExistentes = new HashSet<string>();
+            using (var comandoProductos = new MySqlCommand("SELECT codigo FROM productos", conexion))
+            using (var lector = comandoProductos.ExecuteReader())
+            {
+                while (lector.Read())
+                {
+                    codigosExistentes.Add(lector.GetString("codigo"));
+                }
+            }
+
+            // 2. Stock por (codigo, talla), sin repetir
+            var stocks = new Dictionary<(string Codigo, int Talla), int>();
+            int descartadas = 0;
+            int duplicadas = 0;
+            int conflictos = 0;
+            int corregidas = 0;
+
+            foreach (JsonNode? producto in raiz["productos"]!.AsArray())
+            {
+                string? codigoOriginal = producto?["codigo"]?.GetValue<string>();
+                string? codigo = codigoOriginal?.Trim();
+
+                if (codigo != codigoOriginal)
+                {
+                    corregidas++;
+                }
+
+                foreach (JsonNode? talla in producto?["tallas"]?.AsArray() ?? new JsonArray())
+                {
+                    int? valorTalla = talla?["talla"]?.GetValue<int>();
+                    int? stock = talla?["stock"]?.GetValue<int>();
+
+                    if (string.IsNullOrWhiteSpace(codigo) || !codigosExistentes.Contains(codigo) ||
+                        valorTalla is null || stock is null || stock < 0)
+                    {
+                        descartadas++;
+                        continue;
+                    }
+
+                    var clave = (Codigo: codigo, Talla: valorTalla.Value);
+
+                    if (stocks.TryGetValue(clave, out int stockExistente))
+                    {
+                        if (stockExistente == stock.Value)
+                        {
+                            duplicadas++;
+                        }
+                        else
+                        {
+                            conflictos++;
+                        }
+                    }
+                    else
+                    {
+                        stocks[clave] = stock.Value;
+                    }
+                }
+            }
+
+            // 3. Inserción en una transacción
+            using var transaccion = conexion.BeginTransaction();
+            try
+            {
+                const string sql = @"INSERT INTO producto_talla (codigo, talla, stock) VALUES (@codigo, @talla, @stock)
+                             ON DUPLICATE KEY UPDATE codigo = codigo";
+                int nuevas = 0;
+
+                foreach (var entrada in stocks)
+                {
+                    using var comando = new MySqlCommand(sql, conexion, transaccion);
+                    comando.Parameters.AddWithValue("@codigo", entrada.Key.Codigo);
+                    comando.Parameters.AddWithValue("@talla", entrada.Key.Talla);
+                    comando.Parameters.AddWithValue("@stock", entrada.Value);
+                    nuevas += comando.ExecuteNonQuery();
+                }
+
+                transaccion.Commit();
+                Console.WriteLine($"Producto-talla: {nuevas} nuevas, {stocks.Count - nuevas} ya existentes, " +
+                                  $"{duplicadas} duplicadas en el JSON, {conflictos} con stock distinto, " +
+                                  $"{descartadas} descartadas (talla nula, stock inválido o producto inexistente), " +
+                                  $"{corregidas} con espacios corregidos.");
+            }
+            catch
+            {
+                transaccion.Rollback();
+                throw;
+            }
+        }
+        public static void ImportarTienda(MySqlConnection conexion, JsonNode? raiz)
+        {
+            if (raiz is null)
+            {
+                Console.WriteLine("No hay datos del JSON para importar.");
+                return;
+            }
+
+            JsonNode? tienda = raiz["tienda"];
+            if (tienda is null)
+            {
+                Console.WriteLine("El JSON no contiene el bloque 'tienda'.");
+                return;
+            }
+
+            string? nombre = tienda["nombre"]?.GetValue<string>()?.Trim();
+            string? ciudad = tienda["ciudad"]?.GetValue<string>()?.Trim();
+            int? ejercicio = tienda["ejercicio"]?.GetValue<int>();
+            string? nota = tienda["nota"]?.GetValue<string>()?.Trim();
+
+            if (string.IsNullOrWhiteSpace(nombre) || string.IsNullOrWhiteSpace(ciudad) || ejercicio is null)
+            {
+                Console.WriteLine("Datos de tienda incompletos. No se importa.");
+                return;
+            }
+
+            using var transaccion = conexion.BeginTransaction();
+            try
+            {
+                // La tabla no tiene clave única: comprobamos si ya hay una fila
+                using (var comprobar = new MySqlCommand("SELECT COUNT(*) FROM tienda", conexion, transaccion))
+                {
+                    long existentes = Convert.ToInt64(comprobar.ExecuteScalar());
+                    if (existentes > 0)
+                    {
+                        transaccion.Commit();
+                        Console.WriteLine("Tienda: ya estaba importada, no se inserta de nuevo.");
+                        return;
+                    }
+                }
+
+                const string sql = @"INSERT INTO tienda (nombre, ciudad, ejercicio, nota)
+                             VALUES (@nombre, @ciudad, @ejercicio, @nota)";
+                using (var comando = new MySqlCommand(sql, conexion, transaccion))
+                {
+                    comando.Parameters.AddWithValue("@nombre", nombre);
+                    comando.Parameters.AddWithValue("@ciudad", ciudad);
+                    comando.Parameters.AddWithValue("@ejercicio", ejercicio.Value);
+                    comando.Parameters.AddWithValue("@nota", (object?)nota ?? DBNull.Value);
+                    comando.ExecuteNonQuery();
+                }
+
+                transaccion.Commit();
+                Console.WriteLine($"Tienda: 1 fila insertada ({nombre}, {ciudad}, {ejercicio.Value}).");
+            }
+            catch
+            {
+                transaccion.Rollback();
+                throw;
+            }
+        }
+        public static void ImportarClientes(MySqlConnection conexion, JsonNode? raiz)
+        {
+            if (raiz is null)
+            {
+                Console.WriteLine("No hay datos del JSON para importar.");
+                return;
+            }
+
+            // Los clientes no tienen lista propia en el JSON: se sacan de cada ticket
+            var clientes = new Dictionary<string, (string Nombre, string Ciudad)>();
+            int sinCliente = 0;
+            int descartados = 0;
+            int conflictos = 0;
+            int duplicados = 0;
+            int corregidos = 0;
+
+            foreach (JsonNode? ticket in raiz["tickets"]!.AsArray())
+            {
+                JsonNode? cliente = ticket?["cliente"];
+
+                if (cliente is null)
+                {
+                    sinCliente++;
+                    continue;
+                }
+
+                string? idOriginal = cliente["id"]?.GetValue<string>();
+                string? nombreOriginal = cliente["nombre"]?.GetValue<string>();
+                string? ciudadOriginal = cliente["ciudad"]?.GetValue<string>();
+
+                string? id = idOriginal?.Trim();
+                string? nombre = nombreOriginal?.Trim();
+                string? ciudad = ciudadOriginal?.Trim();
+
+                if (id != idOriginal || nombre != nombreOriginal || ciudad != ciudadOriginal)
+                {
+                    corregidos++;
+                }
+
+                if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(nombre) || string.IsNullOrWhiteSpace(ciudad))
+                {
+                    descartados++;
+                    continue;
+                }
+
+                var datos = (Nombre: nombre, Ciudad: ciudad);
+
+                if (clientes.TryGetValue(id, out var existente))
+                {
+                    if (existente == datos)
+                    {
+                        duplicados++;
+                    }
+                    else
+                    {
+                        conflictos++;
+                    }
+                }
+                else
+                {
+                    clientes[id] = datos;
+                }
+            }
+
+            using var transaccion = conexion.BeginTransaction();
+            try
+            {
+                const string sql = @"INSERT INTO clientes (id, nombre, ciudad) VALUES (@id, @nombre, @ciudad)
+                             ON DUPLICATE KEY UPDATE id = id";
+                int nuevos = 0;
+
+                foreach (var cliente in clientes)
+                {
+                    using var comando = new MySqlCommand(sql, conexion, transaccion);
+                    comando.Parameters.AddWithValue("@id", cliente.Key);
+                    comando.Parameters.AddWithValue("@nombre", cliente.Value.Nombre);
+                    comando.Parameters.AddWithValue("@ciudad", cliente.Value.Ciudad);
+                    nuevos += comando.ExecuteNonQuery();
+                }
+
+                transaccion.Commit();
+                Console.WriteLine($"Clientes: {nuevos} nuevos, {clientes.Count - nuevos} ya existentes, " +
+                                  $"{sinCliente} tickets sin cliente, {duplicados} duplicados en el JSON, " +
+                                  $"{conflictos} con datos distintos, {descartados} descartados, " +
+                                  $"{corregidos} con espacios corregidos.");
+            }
+            catch
+            {
+                transaccion.Rollback();
+                throw;
+            }
+        }
+        public static void ImportarTickets(MySqlConnection conexion, JsonNode? raiz)
+        {
+            if (raiz is null)
+            {
+                Console.WriteLine("No hay datos del JSON para importar.");
+                return;
+            }
+
+            // 1. Números de ticket que ya están en la base (la columna no es UNIQUE)
+            var numerosExistentes = new HashSet<string>();
+            using (var comandoTickets = new MySqlCommand("SELECT numero FROM tickets", conexion))
+            using (var lector = comandoTickets.ExecuteReader())
+            {
+                while (lector.Read())
+                {
+                    numerosExistentes.Add(lector.GetString("numero"));
+                }
+            }
+
+            string[] formatosFecha = { "yyyy-MM-dd", "dd/MM/yyyy" };
+            string[] formatosHora = { "hh\\:mm", "hh\\:mm\\:ss" };
+
+            var tickets = new Dictionary<string, (DateTime Fecha, TimeSpan Hora, string Vendedor, string FormaPago, string? IdCliente)>();
+            int descartados = 0;
+            int yaExistentes = 0;
+            int duplicados = 0;
+            int conflictos = 0;
+            int corregidos = 0;
+            int fechasConvertidas = 0;
+
+            foreach (JsonNode? ticket in raiz["tickets"]!.AsArray())
+            {
+                string? numeroOriginal = ticket?["numero"]?.GetValue<string>();
+                string? fechaOriginal = ticket?["fecha"]?.GetValue<string>();
+                string? horaOriginal = ticket?["hora"]?.GetValue<string>();
+                string? vendedorOriginal = ticket?["vendedor"]?.GetValue<string>();
+                string? formaPagoOriginal = ticket?["forma_pago"]?.GetValue<string>();
+                string? idClienteOriginal = ticket?["cliente"]?["id"]?.GetValue<string>();
+
+                string? numero = numeroOriginal?.Trim();
+                string? fechaTexto = fechaOriginal?.Trim();
+                string? horaTexto = horaOriginal?.Trim();
+                string? vendedor = vendedorOriginal?.Trim();
+                string? formaPago = formaPagoOriginal?.Trim();
+                string? idCliente = string.IsNullOrWhiteSpace(idClienteOriginal) ? null : idClienteOriginal.Trim();
+
+                if (numero != numeroOriginal || fechaTexto != fechaOriginal || horaTexto != horaOriginal ||
+                    vendedor != vendedorOriginal || formaPago != formaPagoOriginal || idCliente != idClienteOriginal)
+                {
+                    corregidos++;
+                }
+
+                if (string.IsNullOrWhiteSpace(numero) || string.IsNullOrWhiteSpace(fechaTexto) ||
+                    string.IsNullOrWhiteSpace(horaTexto) || string.IsNullOrWhiteSpace(vendedor) ||
+                    string.IsNullOrWhiteSpace(formaPago))
+                {
+                    descartados++;
+                    continue;
+                }
+
+                if (!DateTime.TryParseExact(fechaTexto, formatosFecha, System.Globalization.CultureInfo.InvariantCulture,
+                                            System.Globalization.DateTimeStyles.None, out DateTime fecha) ||
+                    !TimeSpan.TryParseExact(horaTexto, formatosHora, System.Globalization.CultureInfo.InvariantCulture,
+                                            out TimeSpan hora))
+                {
+                    descartados++;
+                    continue;
+                }
+
+                if (fechaTexto.Contains('/'))
+                {
+                    fechasConvertidas++;
+                }
+
+                if (numerosExistentes.Contains(numero))
+                {
+                    yaExistentes++;
+                    continue;
+                }
+
+                var datos = (Fecha: fecha, Hora: hora, Vendedor: vendedor, FormaPago: formaPago, IdCliente: idCliente);
+
+                if (tickets.TryGetValue(numero, out var existente))
+                {
+                    if (existente == datos)
+                    {
+                        duplicados++;
+                    }
+                    else
+                    {
+                        conflictos++;
+                    }
+                }
+                else
+                {
+                    tickets[numero] = datos;
+                }
+            }
+
+            // 2. Inserción en una transacción
+            using var transaccion = conexion.BeginTransaction();
+            try
+            {
+                const string sql = @"INSERT INTO tickets (numero, fecha, hora, vendedor, forma_pago, id_cliente)
+                             VALUES (@numero, @fecha, @hora, @vendedor, @formaPago, @idCliente)";
+                int nuevos = 0;
+
+                foreach (var ticket in tickets)
+                {
+                    using var comando = new MySqlCommand(sql, conexion, transaccion);
+                    comando.Parameters.AddWithValue("@numero", ticket.Key);
+                    comando.Parameters.AddWithValue("@fecha", ticket.Value.Fecha);
+                    comando.Parameters.AddWithValue("@hora", ticket.Value.Hora);
+                    comando.Parameters.AddWithValue("@vendedor", ticket.Value.Vendedor);
+                    comando.Parameters.AddWithValue("@formaPago", ticket.Value.FormaPago);
+                    comando.Parameters.AddWithValue("@idCliente", (object?)ticket.Value.IdCliente ?? DBNull.Value);
+                    nuevos += comando.ExecuteNonQuery();
+                }
+
+                transaccion.Commit();
+                Console.WriteLine($"Tickets: {nuevos} nuevos, {yaExistentes} ya existentes, " +
+                                  $"{duplicados} duplicados idénticos en el JSON, {conflictos} con datos distintos, " +
+                                  $"{descartados} descartados, {fechasConvertidas} fechas convertidas de dd/MM/aaaa, " +
+                                  $"{corregidos} con espacios corregidos.");
+            }
+            catch
+            {
+                transaccion.Rollback();
+                throw;
+            }
+        }
+        public static void ImportarLineasTicket(MySqlConnection conexion, JsonNode? raiz)
+        {
+            if (raiz is null)
+            {
+                Console.WriteLine("No hay datos del JSON para importar.");
+                return;
+            }
+
+            // 1. Id de cada ticket según su número
+            var idTickets = new Dictionary<string, int>();
+            using (var comandoTickets = new MySqlCommand("SELECT id_ticket, numero FROM tickets", conexion))
+            using (var lector = comandoTickets.ExecuteReader())
+            {
+                while (lector.Read())
+                {
+                    idTickets[lector.GetString("numero")] = lector.GetInt32("id_ticket");
+                }
+            }
+
+            // 2. Códigos de producto del catálogo (solo para contar, no para descartar)
+            var codigosProducto = new HashSet<string>();
+            using (var comandoProductos = new MySqlCommand("SELECT codigo FROM productos", conexion))
+            using (var lector = comandoProductos.ExecuteReader())
+            {
+                while (lector.Read())
+                {
+                    codigosProducto.Add(lector.GetString("codigo"));
+                }
+            }
+
+            // 3. Tickets que ya tienen líneas, para no duplicarlas al repetir la importación
+            var ticketsConLineas = new HashSet<int>();
+            using (var comandoLineas = new MySqlCommand("SELECT DISTINCT id_ticket FROM lineas_ticket", conexion))
+            using (var lector = comandoLineas.ExecuteReader())
+            {
+                while (lector.Read())
+                {
+                    ticketsConLineas.Add(lector.GetInt32("id_ticket"));
+                }
+            }
+
+            var lineas = new List<(int IdTicket, string Codigo, int Talla, int Unidades, int? Descuento, decimal Precio)>();
+            int ticketsOmitidos = 0;
+            int ticketsNoEncontrados = 0;
+            int descartadas = 0;
+            int sinProducto = 0;
+            int corregidas = 0;
+
+            foreach (JsonNode? ticket in raiz["tickets"]!.AsArray())
+            {
+                string? numeroOriginal = ticket?["numero"]?.GetValue<string>();
+                string? numero = numeroOriginal?.Trim();
+
+                if (numero != numeroOriginal)
+                {
+                    corregidas++;
+                }
+
+                if (string.IsNullOrWhiteSpace(numero) || !idTickets.TryGetValue(numero, out int idTicket))
+                {
+                    ticketsNoEncontrados++;
+                    continue;
+                }
+
+                if (ticketsConLineas.Contains(idTicket))
+                {
+                    ticketsOmitidos++;
+                    continue;
+                }
+
+                foreach (JsonNode? linea in ticket?["lineas"]?.AsArray() ?? new JsonArray())
+                {
+                    string? codigoOriginal = linea?["codigo"]?.GetValue<string>();
+                    string? codigo = codigoOriginal?.Trim();
+
+                    if (codigo != codigoOriginal)
+                    {
+                        corregidas++;
+                    }
+
+                    int? talla = linea?["talla"]?.GetValue<int>();
+                    int? unidades = linea?["unidades"]?.GetValue<int>();
+                    int? descuento = linea?["descuento_pct"]?.GetValue<int>();
+                    decimal? precio = linea?["precio_unitario"]?.GetValue<decimal>();
+
+                    if (string.IsNullOrWhiteSpace(codigo) || talla is null || unidades is null || unidades <= 0 ||
+                        precio is null || precio < 0 || (descuento is not null && (descuento < 0 || descuento > 100)))
+                    {
+                        descartadas++;
+                        continue;
+                    }
+
+                    if (!codigosProducto.Contains(codigo))
+                    {
+                        sinProducto++;
+                    }
+
+                    lineas.Add((idTicket, codigo, talla.Value, unidades.Value, descuento, precio.Value));
+                }
+            }
+
+            // 4. Inserción en una transacción
+            using var transaccion = conexion.BeginTransaction();
+            try
+            {
+                const string sql = @"INSERT INTO lineas_ticket (id_ticket, codigo, talla, unidades, descuento_pct, precio_unitario)
+                             VALUES (@idTicket, @codigo, @talla, @unidades, @descuento, @precio)";
+                int nuevas = 0;
+
+                foreach (var linea in lineas)
+                {
+                    using var comando = new MySqlCommand(sql, conexion, transaccion);
+                    comando.Parameters.AddWithValue("@idTicket", linea.IdTicket);
+                    comando.Parameters.AddWithValue("@codigo", linea.Codigo);
+                    comando.Parameters.AddWithValue("@talla", linea.Talla);
+                    comando.Parameters.AddWithValue("@unidades", linea.Unidades);
+                    comando.Parameters.AddWithValue("@descuento", (object?)linea.Descuento ?? DBNull.Value);
+                    comando.Parameters.AddWithValue("@precio", linea.Precio);
+                    nuevas += comando.ExecuteNonQuery();
+                }
+
+                transaccion.Commit();
+                Console.WriteLine($"Líneas de ticket: {nuevas} nuevas, {ticketsOmitidos} tickets omitidos (ya tenían líneas), " +
+                                  $"{ticketsNoEncontrados} tickets no encontrados, {descartadas} descartadas, " +
+                                  $"{sinProducto} con código sin producto en catálogo (conservadas), " +
+                                  $"{corregidas} con espacios corregidos.");
+            }
+            catch
+            {
+                transaccion.Rollback();
+                throw;
+            }
+        }
+        public static void ImportarTablas(MySqlConnection conexion, JsonNode? raiz)
+        {
+            ImportarTienda(conexion, raiz);
+            ImportarMarcas(conexion, raiz);
+            ImportarProveedores(conexion, raiz);
+            ImportarProductos(conexion, raiz);
+            ImportarProductoProveedor(conexion, raiz);
+            ImportarProductoTalla(conexion, raiz);
+            ImportarClientes(conexion, raiz);
+            ImportarTickets(conexion, raiz);
+            ImportarLineasTicket(conexion, raiz);
+        }
+
         public static void Main()
         {
             try
@@ -619,9 +1146,8 @@ namespace Zapateria
                 JsonNode? raiz = LeerJsonZapateria();
                 Reiniciar(ConexionBBDD);
                 CrearTablas(ConexionBBDD);
-                ImportarMarcas(ConexionBBDD, raiz);
-                ImportarProveedores(ConexionBBDD, raiz);
-                ImportarProductos(ConexionBBDD, raiz);
+                ImportarTablas(ConexionBBDD, raiz);
+
 
 
             }
